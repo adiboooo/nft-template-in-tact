@@ -4,23 +4,23 @@ const gasConsumption: Int = ton("0.02");
 
 contract NftCollection {
     next_item_index: Int as uint32 = 0;
-    owner_address: Address;
-    royalty_params: RoyaltyParams?;                      
-    collection_content: Cell;   
+    owner_address: Address;            
+    collection_content: Cell; 
 
-    init(owner_address: Address, collection_content: Cell, royalty_params: RoyaltyParams){
+    init(owner_address: Address, collection_content: Cell) {
         self.owner_address = owner_address;
         self.collection_content = collection_content; 
-        self.royalty_params = royalty_params;
     }
 
-    receive("Mint"){
+    receive(msg: MintSbt) {
+        require(sender() == self.owner_address, "Only owner can mint SBT");
+
         let ctx: Context = context(); // get sender Info
         let msgValue: Int = ctx.value;
         let tonBalanceBeforeMsg: Int = myBalance() - msgValue;
         let storageFee: Int = minTonsForStorage - min(tonBalanceBeforeMsg, minTonsForStorage);
         msgValue = msgValue - (storageFee + gasConsumption);
-        self.mint(ctx.sender, msgValue);
+        self.mint(msg.recipient, msgValue);
 
         emit(LogEventMintRecord{ minter: sender(), item_id: self.next_item_index, generate_number: nativeRandom() }.toCell());
     }
@@ -45,24 +45,7 @@ contract NftCollection {
                 code: nft_init.code,
                 data: nft_init.data
             });
-        // dump(self.next_item_index); // Reference at: https://tact-by-example.org/03-emit
         self.next_item_index = self.next_item_index + 1;
-    }
-
-    receive(msg: GetRoyaltyParams) {   
-        let ctx: Context = context(); // get sender Info
-        send(SendParameters{
-            to: ctx.sender,
-            value: 0,
-            mode: 64, 
-            bounce: false,
-            body: ReportRoyaltyParams {
-                query_id: msg.query_id,
-                numerator:  (self.royalty_params!!).numerator,
-                denominator: (self.royalty_params!!).denominator,
-                destination: self.owner_address
-            }.toCell()
-        });        
     }
 
     // ------------------ Get Function  ------------------ //
@@ -93,10 +76,6 @@ contract NftCollection {
         b.append(ic);
         return b.toCell();
     }
-
-    get fun royalty_params(): RoyaltyParams {
-        return self.royalty_params!!;
-    }
 }
 
 contract NftItem {
@@ -106,6 +85,9 @@ contract NftItem {
 
     owner: Address?;
     individual_content: Cell?;
+
+    authority_address: Address?;
+    revoked_at: Int as uint64 = 0;
 
     init(collection_address: Address, item_index: Int){
         require(sender() == collection_address, "not from collection");
@@ -122,40 +104,16 @@ contract NftItem {
             require(ctx.sender == self.collection_address, "initialized tx need from collection");
             self.is_initialized = true;
             self.owner = msg.new_owner;
+            self.authority_address = msg.response_destination;
             self.individual_content = msg.custom_payload;
             send(SendParameters{
-                to: msg.response_destination!!,
+                to: msg.response_destination,
                 value: msgValue,
                 mode: SendPayGasSeparately,
                 body: Excesses { query_id: msg.query_id }.toCell()
             });
         } else {
-            require(ctx.sender == self.owner!!, "not owner");
-            self.owner = msg.new_owner;  // change current owner to the new_owner
-            if (msg.forward_amount > 0) {
-                send(SendParameters{
-                    to: msg.new_owner,
-                    value: msg.forward_amount,
-                    mode:  SendPayGasSeparately, 
-                    bounce: true,
-                    body: OwnershipAssigned{
-                        query_id: msg.query_id,
-                        prev_owner: ctx.sender,
-                        forward_payload: msg.forward_payload
-                    }.toCell()
-                }); 
-            }
-
-            msgValue = msgValue - ctx.readForwardFee(); 
-            if (msg.response_destination != null) { 
-                send(SendParameters{ 
-                    to: msg.response_destination!!,
-                    value: msgValue - msg.forward_amount,
-                    mode: SendPayGasSeparately,
-                    bounce: true,
-                    body: Excesses { query_id: msg.query_id }.toCell()
-                });
-            } 
+            require(false, "SBT cannot be transferred");
         }
     }
     
@@ -172,6 +130,82 @@ contract NftItem {
                 collection: self.collection_address
             }.toCell()
         });
+    }
+
+    receive(msg: ProveOwnership) {
+        require(sender() == self.owner, "Not owner");
+
+        /**
+         * Based on TEP standard
+         * https://github.com/ton-blockchain/TEPs/blob/master/text/0085-sbt-standard.md#1-prove_ownership
+        */
+        let content: Cell? = null;
+        if (msg.with_content) {
+            content = self.individual_content;
+        }
+
+        send(SendParameters{
+            to: msg.dest,
+            value: 0,
+            mode: 64,
+            body: OwnershipProof {
+                query_id: msg.query_id,
+                item_id: self.item_index,
+                owner: self.owner!!,
+                data: msg.forward_payload,
+                revoked_at: self.revoked_at,
+                content: content
+            }.toCell()
+        });
+    }
+
+    receive(msg: RequestOwner) {
+        /**
+         * Based on TEP standard
+         * https://github.com/ton-blockchain/TEPs/blob/master/text/0085-sbt-standard.md#2-request_owner
+        */
+        let content: Cell? = null;
+        if (msg.with_content) {
+            content = self.individual_content;
+        }
+
+        send(SendParameters{
+            to: msg.dest,
+            value: 0,
+            mode: 64,
+            body: OwnerInfo {
+                query_id: msg.query_id,
+                item_id: self.item_index,
+                initiator: sender(),
+                owner: self.owner!!,
+                data: msg.forward_payload,
+                revoked_at: self.revoked_at,
+                content: content
+            }.toCell()
+        });
+    }
+
+    receive("Destroy") {
+        require(sender() == self.owner, "Not owner");
+        self.owner = null;
+        self.authority_address = null;
+        self.revoked_at = 0;
+        let excess: Int = myBalance() - context().value - minTonsForStorage;
+
+        if (excess > 0) {
+            send(SendParameters{
+                to: sender(),
+                bounce: false,
+                value: excess,
+                mode: SendRemainingValue + SendIgnoreErrors
+            });
+        }
+    }
+
+    receive(msg: Revoke) {
+        require(sender() == self.authority_address, "Not authorized");
+        require(self.revoked_at == 0, "Already revoked");
+        self.revoked_at = now();
     }
 
     fun msgValue(value: Int): Int {
@@ -195,5 +229,13 @@ contract NftItem {
             owner_address: self.owner!!,
             individual_content: b.toCell()
         };
+    }
+
+    get fun get_authority_address(): Address? {
+        return self.authority_address;
+    }
+
+    get fun get_revoked_time(): Int {
+        return self.revoked_at;
     }
 }
